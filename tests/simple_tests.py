@@ -38,6 +38,18 @@ def test_vertex_values_match():
     assert (output == data_points.reshape(-1)).all().item()
 
 
+def test_1d_sampler():
+    batch = 1
+    feature_channel_num = 1
+    tf_data = torch.tensor([1., 2., 3., 4., 5.]).reshape(-1, feature_channel_num)
+    tf_model = samplers.TransferFunctionModel1D(tf_data, False)
+    scalars = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]).reshape(batch, -1)
+    interpolated_values = tf_model(scalars)
+    assert interpolated_values.shape == (batch, feature_channel_num, scalars.shape[-1])
+    print(interpolated_values)
+
+
 if __name__ == "__main__":
     test_shape_match()
     test_vertex_values_match()
+    test_1d_sampler()
