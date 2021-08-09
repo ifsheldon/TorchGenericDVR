@@ -64,6 +64,8 @@ class TrilinearVolumeSampler(pl.LightningModule):
         :param sample_indices: tensor of shape (batch, width, height, 3), range = [-1, 1]
         :return: interpolated tensor of shape (batch, volume_channel, width, height)
         """
+        assert len(sample_indices.shape) == 4
+        assert sample_indices.shape[-1] == 3
         batch_size = sample_indices.shape[0]
         volume_not_batched = self.volume_batch_size == 0
         assert volume_not_batched or self.volume_batch_size == batch_size
