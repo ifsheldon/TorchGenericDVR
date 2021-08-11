@@ -64,6 +64,7 @@ class TrilinearInterpolation(pl.LightningModule):
             scaling_factor = torch.FloatTensor([width - 1.0, height - 1.0, num_d - 1.0]).view(1, 1, 1, 3)
         else:
             scaling_factor = self._scale_factor
+        scaling_factor = scaling_factor.to(sampling_grid.device)
         sampling_grid = scaling_factor * sampling_grid
         # Now sampling grid is between [0, w-1; 0,h-1; 0,d-1]
         x, y, z = torch.split(sampling_grid, split_size_or_sections=1, dim=3)
