@@ -442,13 +442,18 @@ def load_head_data():
 # FIXME: fix all .to() in this file and in pl_modules.py and fxxking mixing np and torch in this file
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
-    head_data = load_head_data().astype(np.float32)
+    head_data = load_head_data().astype(np.float32).transpose([2, 1, 0])
     uint16_max = float(np.iinfo(np.uint16).max)
     normalized_head_data = head_data / uint16_max
     head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
     tf = torch.from_numpy(load_transfer_function()).float()
-    gen = Generator(head_tensor, tf, feature_img_resolution=256, range_u=(0., 0.5), range_v=(0., 0.5)).cuda()
-    img = gen(batch_size=8, mode="testing")
+    gen = Generator(head_tensor, tf,
+                    feature_img_resolution=256,
+                    range_u=(0., 0.5),
+                    range_v=(0., 0.5),
+                    n_ray_samples=600).eval().cuda()
+    with torch.no_grad():
+        img = gen(batch_size=1, mode="testing")
     to_pil_img = ToPILImage()
     for i in range(img.shape[0]):
         pil_img = to_pil_img(img[i])
