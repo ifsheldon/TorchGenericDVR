@@ -3,10 +3,10 @@ from torch import nn
 import logging
 import numpy as np
 import torch.nn.functional as F
-import pickle
 import pytorch_lightning as pl
 from samplers import TrilinearVolumeSampler, TransferFunctionModel1D
 from torchvision.transforms import ToPILImage
+from utils import *
 
 
 def to_sphere(u, v):
@@ -251,7 +251,7 @@ class Generator(pl.LightningModule):
 
     def get_random_pose(self, range_u, range_v, range_radius, batch_size=32,
                         invert=False):
-        location = self.sample_on_sphere(range_u, range_v, batch_size=(batch_size))
+        location = self.sample_on_sphere(range_u, range_v, batch_size=batch_size)
         radius = range_radius[0] + \
                  torch.rand(batch_size) * (range_radius[1] - range_radius[0])
         location = location * radius.unsqueeze(-1).to(self.device)
@@ -360,36 +360,6 @@ class Generator(pl.LightningModule):
         feat_map = feat_map.permute(0, 2, 1).reshape(batch_size, -1, img_res, img_res)  # B x feat x h x w
         feat_map = feat_map.permute(0, 1, 3, 2)  # new to flip x/y
         return feat_map
-
-
-def load_transfer_function():
-    return np.array([0.0, 0.0, 0.0, 0.0,
-                     0.0, 0.5, 0.5, 0.0,
-                     0.0, 0.5, 0.5, 0.01,
-                     0.0, 0.5, 0.5, 0.0,
-                     0.5, 0.5, 0.0, 0.0,
-                     0.5, 0.5, 0.0, 0.2,
-                     0.5, 0.5, 0.0, 0.5,
-                     0.5, 0.5, 0.0, 0.2,
-                     0.5, 0.5, 0.0, 0.0,
-                     0.0, 0.0, 0.0, 0.0,
-                     1.0, 0.0, 1.0, 0.0,
-                     1.0, 0.0, 1.0, 0.8]).reshape(12, 4)
-
-
-def load_data(file_path):
-    with open(file_path, "rb") as f:
-        data = pickle.load(f)
-        return data
-
-
-def dump_data(data, file_path):
-    with open(file_path, "wb") as f:
-        pickle.dump(data, f)
-
-
-def load_head_data():
-    return load_data("./skewed_head.pickle")
 
 
 # FIXME: fix all .to() in this file and in pl_modules.py and fxxking mixing np and torch in this file

@@ -1,5 +1,5 @@
 import torch
-from wrappers import samplers
+from torch_generic_dvr import samplers
 
 POSITION_DIMS = 3
 
