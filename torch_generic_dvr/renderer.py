@@ -292,49 +292,43 @@ class Generator(pl.LightningModule):
         world_mat = self.get_random_pose(self.range_u, self.range_v, self.range_radius, batch_size)
         return camera_mat, world_mat
 
-    def volume_render_image(self, camera_matrices, batch_size, mode='training'):
-        img_res = self.feature_img_resolution
-        n_steps = self.n_ray_samples
-        depth_range = self.depth_range
-        n_points = img_res * img_res
-        camera_mat, world_mat = camera_matrices
-
+    def cast_ray_and_get_eval_points(self, img_res, batch_size, depth_range, n_steps, camera_mat, world_mat,
+                                     ray_jittering):
         # Arrange Pixels
         pixels = self.arrange_pixels((img_res, img_res), batch_size, invert_y_axis=False)[1]
         pixels[..., -1] *= -1.
+        n_points = img_res * img_res
         # Project to 3D world
-        pixel_pos_wc = self.image_points_to_world(
-            pixels, camera_mat,
-            world_mat)
-        camera_pos_wc = self.origin_to_world(
-            n_points, camera_mat,
-            world_mat)
-
-        logging.debug(f"pixel_pos_wc shape = {pixel_pos_wc.shape}")
-        logging.debug(f"camera_pos_wc shape = {camera_pos_wc.shape}")
-        logging.debug(f"camera_pos_wc = {camera_pos_wc}")
-
+        pixel_pos_wc = self.image_points_to_world(pixels, camera_mat, world_mat)
+        camera_pos_wc = self.origin_to_world(n_points, camera_mat, world_mat)
         # batch_size x n_points x n_steps
         step_depths = depth_range[0] + \
                       torch.linspace(0., 1., steps=n_steps).reshape(1, 1, -1) * (
                               depth_range[1] - depth_range[0])
         step_depths = step_depths.repeat(batch_size, n_points, 1).to(self.device)
-        logging.debug(f"di shape = {step_depths.shape}")
-        if mode == 'training':
+        if ray_jittering:
             step_depths = add_noise_to_interval(step_depths)
-
         point_pos_wc = get_evaluation_points(pixel_pos_wc, camera_pos_wc,
                                              step_depths)  # shape (batch, num of eval points, 3)
+        return point_pos_wc
+
+    def volume_render_image(self, camera_matrices, batch_size, mode='training'):
+        img_res = self.feature_img_resolution
+        n_steps = self.n_ray_samples
+        camera_mat, world_mat = camera_matrices
+        point_pos_wc = self.cast_ray_and_get_eval_points(img_res, batch_size, self.depth_range, n_steps,
+                                                         camera_mat, world_mat, mode == "training")
         logging.debug(f"point pos wc shape = {point_pos_wc.shape}")
         density_scalars = self.volume_sampler(
             point_pos_wc.unsqueeze(1))  # shape (batch, channel=1, 1, num of eval points)
         density_scalars = density_scalars.view(batch_size, -1)
-        feature_with_alpha = self.tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, channel)
         if mode == 'training':
             # As done in NeRF, add noise during training
             density_scalars += torch.randn_like(density_scalars)
 
+        feature_with_alpha = self.tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, channel)
         # Reshape
+        n_points = img_res * img_res
         feature_with_alpha = feature_with_alpha.reshape(batch_size,
                                                         n_points,
                                                         n_steps,
