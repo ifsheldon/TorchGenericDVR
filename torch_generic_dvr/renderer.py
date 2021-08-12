@@ -98,8 +98,8 @@ class Generator(pl.LightningModule):
         sample = torch.stack([cx, cy, cz], dim=-1).float().to(self.device)
         return sample
 
-    def transform_to_world(self, pixels, depth, camera_mat, world_mat, scale_mat=None,
-                           invert=True, use_absolute_depth=True):
+    def transform_to_world(self, pixels, depth, camera_mat, world_mat, scale_mat,
+                           invert, use_absolute_depth=True):
         ''' Transforms pixel positions p with given depth value d to world coordinates.
 
         Args:
