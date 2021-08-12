@@ -276,21 +276,15 @@ class Generator(pl.LightningModule):
                                        scale_mat, invert=invert)
 
     def forward(self, batch_size=32, mode="training"):
-        camera_matrices = self.sample_random_camera(batch_size)
-        logging.debug(f"\ncamera mat shape = {camera_matrices[0].shape}"
-                      f"\nworld mat shape = {camera_matrices[1].shape}")
-        rgb_v = self.volume_render_image(camera_matrices, batch_size, mode=mode)
+        camera_mat = self.camera_matrix.repeat(batch_size, 1, 1)
+        world_mat = self.get_random_pose(self.range_u, self.range_v, self.range_radius, batch_size)
+        rgb_v = self.volume_render_image(camera_mat, world_mat, batch_size, mode=mode)
 
         if self.neural_renderer is not None:
             rgb = self.neural_renderer(rgb_v)
         else:
             rgb = rgb_v
         return rgb
-
-    def sample_random_camera(self, batch_size=32):
-        camera_mat = self.camera_matrix.repeat(batch_size, 1, 1)
-        world_mat = self.get_random_pose(self.range_u, self.range_v, self.range_radius, batch_size)
-        return camera_mat, world_mat
 
     def cast_ray_and_get_eval_points(self, img_res, batch_size, depth_range, n_steps, camera_mat, world_mat,
                                      ray_jittering):
@@ -312,10 +306,9 @@ class Generator(pl.LightningModule):
                                              step_depths)  # shape (batch, num of eval points, 3)
         return point_pos_wc
 
-    def volume_render_image(self, camera_matrices, batch_size, mode='training'):
+    def volume_render_image(self, camera_mat, world_mat, batch_size, mode='training'):
         img_res = self.feature_img_resolution
         n_steps = self.n_ray_samples
-        camera_mat, world_mat = camera_matrices
         point_pos_wc = self.cast_ray_and_get_eval_points(img_res, batch_size, self.depth_range, n_steps,
                                                          camera_mat, world_mat, mode == "training")
         logging.debug(f"point pos wc shape = {point_pos_wc.shape}")
