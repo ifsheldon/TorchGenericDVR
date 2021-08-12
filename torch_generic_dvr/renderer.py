@@ -1,21 +1,13 @@
+import math
+
 import torch
 from torch import nn
 import logging
 import numpy as np
-import torch.nn.functional as F
 import pytorch_lightning as pl
 from samplers import TrilinearVolumeSampler, TransferFunctionModel1D
 from torchvision.transforms import ToPILImage
 from utils import *
-
-
-def to_sphere(u, v):
-    theta = 2 * np.pi * u
-    phi = np.arccos(1 - 2 * v)
-    cx = np.sin(phi) * np.cos(theta)
-    cy = np.sin(phi) * np.sin(theta)
-    cz = np.cos(phi)
-    return np.stack([cx, cy, cz], axis=-1)
 
 
 def calc_volume_weights(alpha):
@@ -81,17 +73,7 @@ class Generator(pl.LightningModule):
         self.tf = TransferFunctionModel1D(transfer_function_data)
         self.neural_renderer = None if neural_renderer is None else neural_renderer
 
-    def sample_on_sphere(self, range_u=(0, 1), range_v=(0, 1), batch_size=(1,)):
-        u = np.random.uniform(*range_u, size=batch_size)
-        v = np.random.uniform(*range_v, size=batch_size)
-
-        sample = to_sphere(u, v)
-        return torch.tensor(sample).float().to(self.device)
-
     def get_camera_mat(self, fov, invert=True):
-        # fov = 2 * arctan( sensor / (2 * focal))
-        # focal = (sensor / 2)  * 1 / (tan(0.5 * fov))
-        # in our case, sensor = 2 as pixels are in [-1, 1]
         focal = 1. / np.tan(0.5 * fov * np.pi / 180.)
         focal = focal.astype(np.float32)
         mat = torch.tensor([
@@ -100,10 +82,21 @@ class Generator(pl.LightningModule):
             [0., 0., 1, 0.],
             [0., 0., 0., 1.]
         ]).reshape(1, 4, 4)
-
         if invert:
             mat = torch.inverse(mat)
-        return mat.to(self.device)
+        return mat
+
+    def sample_on_sphere(self, range_u, range_v, batch_size):
+        u = torch.rand(batch_size) * (range_u[1] - range_u[0]) + range_u[0]
+        v = torch.rand(batch_size) * (range_v[1] - range_v[0]) + range_v[0]
+        pi = torch.tensor(math.pi)
+        theta = 2 * pi * u
+        phi = torch.arccos(1 - 2 * v)
+        cx = torch.sin(phi) * torch.cos(theta)
+        cy = torch.sin(phi) * torch.sin(theta)
+        cz = torch.cos(phi)
+        sample = torch.stack([cx, cy, cz], dim=-1).float().to(self.device)
+        return sample
 
     def transform_to_world(self, pixels, depth, camera_mat, world_mat, scale_mat=None,
                            invert=True, use_absolute_depth=True):
@@ -178,8 +171,7 @@ class Generator(pl.LightningModule):
         pixel_scaled[:, :, 1] = scale * pixel_scaled[:, :, 1] / (h - 1) - loc
 
         # Subsample points if subsample_to is not None and > 0
-        if (subsample_to is not None and subsample_to > 0 and
-                subsample_to < n_points):
+        if subsample_to is not None and 0 < subsample_to < n_points:
             idx = np.random.choice(pixel_scaled.shape[1], size=(subsample_to,),
                                    replace=False)
             pixel_scaled = pixel_scaled[:, idx]
@@ -205,14 +197,12 @@ class Generator(pl.LightningModule):
             invert (bool): whether to invert the matrices (default: False)
         '''
         batch_size = camera_mat.shape[0]
-        device = camera_mat.device
         # Create origin in homogen coordinates
-        p = torch.zeros(batch_size, 4, n_points).to(device)
+        p = torch.zeros(batch_size, 4, n_points).to(self.device)
         p[:, -1] = 1.
 
         if scale_mat is None:
-            scale_mat = torch.eye(4).unsqueeze(
-                0).repeat(batch_size, 1, 1).to(device)
+            scale_mat = torch.eye(4).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
 
         # Invert matrices
         if invert:
@@ -249,9 +239,8 @@ class Generator(pl.LightningModule):
 
         return torch.tensor(r_mat).float().to(self.device)
 
-    def get_random_pose(self, range_u, range_v, range_radius, batch_size=32,
-                        invert=False):
-        location = self.sample_on_sphere(range_u, range_v, batch_size=batch_size)
+    def get_random_pose(self, range_u, range_v, range_radius, batch_size, invert=False):
+        location = self.sample_on_sphere(range_u, range_v, batch_size)
         radius = range_radius[0] + \
                  torch.rand(batch_size) * (range_radius[1] - range_radius[0])
         location = location * radius.unsqueeze(-1).to(self.device)
@@ -362,7 +351,6 @@ class Generator(pl.LightningModule):
         return feat_map
 
 
-# FIXME: fix all .to() in this file and in pl_modules.py and fxxking mixing np and torch in this file
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
     head_data = load_head_data().astype(np.float32).transpose([2, 1, 0])
