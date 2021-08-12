@@ -3,6 +3,7 @@ from torch import nn
 import logging
 import numpy as np
 import torch.nn.functional as F
+import pickle
 import pytorch_lightning as pl
 from samplers import TrilinearVolumeSampler, TransferFunctionModel1D
 from torchvision.transforms import ToPILImage
@@ -24,51 +25,6 @@ def calc_volume_weights(alpha):
                   torch.ones_like(alpha[:, :, :1]),
                   (1. - alpha + 1e-10), ], dim=-1), dim=-1)[..., :-1]
     return weights
-
-
-def composite_function(sigma, feat):
-    n_boxes = sigma.shape[0]
-    if n_boxes > 1:
-        denom_sigma = torch.sum(sigma, dim=0, keepdim=True)
-        denom_sigma[denom_sigma == 0] = 1e-4
-        w_sigma = sigma / denom_sigma
-        sigma_sum = torch.sum(sigma, dim=0)
-        feat_weighted = (feat * w_sigma.unsqueeze(-1)).sum(0)
-    else:
-        sigma_sum = sigma.squeeze(0)
-        feat_weighted = feat.squeeze(0)
-    return sigma_sum, feat_weighted
-
-
-def get_evaluation_points_bg(pixels_world, camera_world, di,
-                             rotation_matrix):
-    batch_size = pixels_world.shape[0]
-    n_steps = di.shape[-1]
-
-    camera_world = (rotation_matrix @
-                    camera_world.permute(0, 2, 1)).permute(0, 2, 1)
-    pixels_world = (rotation_matrix @
-                    pixels_world.permute(0, 2, 1)).permute(0, 2, 1)
-    ray_world = pixels_world - camera_world
-
-    p = camera_world.unsqueeze(-2).contiguous() + \
-        di.unsqueeze(-1).contiguous() * \
-        ray_world.unsqueeze(-2).contiguous()
-    r = ray_world.unsqueeze(-2).repeat(1, 1, n_steps, 1)
-    assert (p.shape == r.shape)
-    p = p.reshape(batch_size, -1, 3)
-    r = r.reshape(batch_size, -1, 3)
-    return p, r
-
-
-def transform_points_to_box(p, box_transformations, box_idx):
-    bb_s, bb_t, bb_R = box_transformations
-    box_scaling = bb_s[:, box_idx]
-    box_rotation = bb_R[:, box_idx]
-    box_translation = bb_t[:, box_idx]
-    p_box = (box_rotation @ (p - box_translation.unsqueeze(1)).permute(0, 2, 1)).permute(0, 2, 1) / \
-            box_scaling.unsqueeze(1)
-    return p_box
 
 
 def get_evaluation_points(pixels_world, camera_world, di):
@@ -404,9 +360,6 @@ class Generator(pl.LightningModule):
         feat_map = feat_map.permute(0, 2, 1).reshape(batch_size, -1, img_res, img_res)  # B x feat x h x w
         feat_map = feat_map.permute(0, 1, 3, 2)  # new to flip x/y
         return feat_map
-
-
-import pickle
 
 
 def load_transfer_function():
