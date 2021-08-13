@@ -1,5 +1,4 @@
 import math
-
 import torch
 from torch import nn
 import logging
@@ -24,7 +23,6 @@ def get_evaluation_points(pixels_world, camera_world, di):
     ray = pixels_world - camera_world
     p = camera_world.unsqueeze(-2).contiguous() + \
         di.unsqueeze(-1).contiguous() * ray.unsqueeze(-2).contiguous()
-    logging.debug(f"p_i and ray_i shape = {p.shape}")
     p = p.reshape(batch_size, -1, 3)
     return p
 
@@ -38,7 +36,47 @@ def add_noise_to_interval(di):
     return ti
 
 
-class Generator(pl.LightningModule):
+def get_camera_mat(fov, invert=True):
+    focal = 1. / np.tan(0.5 * np.radians(fov))
+    focal = focal.astype(np.float32)
+    mat = torch.tensor([
+        [focal, 0., 0., 0.],
+        [0., focal, 0., 0.],
+        [0., 0., 1, 0.],
+        [0., 0., 0., 1.]
+    ]).reshape(1, 4, 4)
+    if invert:
+        mat = torch.inverse(mat)
+    return mat
+
+
+def transform_to_world(pixels, depth, camera_mat, world_mat, use_absolute_depth=True):
+    ''' Transforms pixel positions p with given depth value d to world coordinates.
+
+    Args:
+        pixels (tensor): pixel tensor of size B x N x 2
+        depth (tensor): depth tensor of size B x N x 1
+        camera_mat (tensor): camera matrix
+        world_mat (tensor): world matrix
+    '''
+    assert (pixels.shape[-1] == 2)
+    # Transform pixels to homogen coordinates
+    pixels = pixels.permute(0, 2, 1)
+    pixels = torch.cat([pixels, torch.ones_like(pixels)], dim=1)
+    # Project pixels into camera space
+    if use_absolute_depth:
+        pixels[:, :2] = pixels[:, :2] * depth.permute(0, 2, 1).abs()
+        pixels[:, 2:3] = pixels[:, 2:3] * depth.permute(0, 2, 1)
+    else:
+        pixels[:, :3] = pixels[:, :3] * depth.permute(0, 2, 1)
+    # Transform pixels to world space
+    p_world = world_mat @ camera_mat @ pixels
+    # Transform p_world back to 3D coordinates
+    p_world = p_world[:, :3].permute(0, 2, 1)
+    return p_world
+
+
+class DirectVolumeRenderer(pl.LightningModule):
     ''' GIRAFFE Generator Class.
 
     Args:
@@ -68,23 +106,10 @@ class Generator(pl.LightningModule):
         self.feature_img_resolution = feature_img_resolution
         self.range_radius = range_radius
         self.depth_range = depth_range
-        self.camera_matrix = nn.Parameter(self.get_camera_mat(fov))
+        self.camera_matrix = nn.Parameter(get_camera_mat(fov))
         self.volume_sampler = TrilinearVolumeSampler(volume)
         self.tf = TransferFunctionModel1D(transfer_function_data)
         self.neural_renderer = None if neural_renderer is None else neural_renderer
-
-    def get_camera_mat(self, fov, invert=True):
-        focal = 1. / np.tan(0.5 * fov * np.pi / 180.)
-        focal = focal.astype(np.float32)
-        mat = torch.tensor([
-            [focal, 0., 0., 0.],
-            [0., focal, 0., 0.],
-            [0., 0., 1, 0.],
-            [0., 0., 0., 1.]
-        ]).reshape(1, 4, 4)
-        if invert:
-            mat = torch.inverse(mat)
-        return mat
 
     def sample_on_sphere(self, range_u, range_v, batch_size):
         u = torch.rand(batch_size) * (range_u[1] - range_u[0]) + range_u[0]
@@ -98,50 +123,7 @@ class Generator(pl.LightningModule):
         sample = torch.stack([cx, cy, cz], dim=-1).float().to(self.device)
         return sample
 
-    def transform_to_world(self, pixels, depth, camera_mat, world_mat, scale_mat,
-                           invert, use_absolute_depth=True):
-        ''' Transforms pixel positions p with given depth value d to world coordinates.
-
-        Args:
-            pixels (tensor): pixel tensor of size B x N x 2
-            depth (tensor): depth tensor of size B x N x 1
-            camera_mat (tensor): camera matrix
-            world_mat (tensor): world matrix
-            scale_mat (tensor): scale matrix
-            invert (bool): whether to invert matrices (default: true)
-        '''
-        assert (pixels.shape[-1] == 2)
-
-        if scale_mat is None:
-            scale_mat = torch.eye(4).unsqueeze(0).repeat(
-                camera_mat.shape[0], 1, 1).to(self.device)
-
-        # Invert camera matrices
-        if invert:
-            camera_mat = torch.inverse(camera_mat)
-            world_mat = torch.inverse(world_mat)
-            scale_mat = torch.inverse(scale_mat)
-
-        # Transform pixels to homogen coordinates
-        pixels = pixels.permute(0, 2, 1)
-        pixels = torch.cat([pixels, torch.ones_like(pixels)], dim=1)
-
-        # Project pixels into camera space
-        if use_absolute_depth:
-            pixels[:, :2] = pixels[:, :2] * depth.permute(0, 2, 1).abs()
-            pixels[:, 2:3] = pixels[:, 2:3] * depth.permute(0, 2, 1)
-        else:
-            pixels[:, :3] = pixels[:, :3] * depth.permute(0, 2, 1)
-
-        # Transform pixels to world space
-        p_world = scale_mat @ world_mat @ camera_mat @ pixels
-
-        # Transform p_world back to 3D coordinates
-        p_world = p_world[:, :3].permute(0, 2, 1)
-        return p_world
-
-    def arrange_pixels(self, resolution=(128, 128), batch_size=1, image_range=(-1., 1.),
-                       subsample_to=None, invert_y_axis=False):
+    def arrange_pixels(self, resolution=(128, 128), batch_size=1, image_range=(-1., 1.), invert_y_axis=False):
         ''' Arranges pixels for given resolution in range image_range.
 
         The function returns the unscaled pixel locations as integers and the
@@ -151,12 +133,8 @@ class Generator(pl.LightningModule):
             resolution (tuple): image resolution
             batch_size (int): batch size
             image_range (tuple): range of output points (default [-1, 1])
-            subsample_to (int): if integer and > 0, the points are randomly
-                subsampled to this value
         '''
         h, w = resolution
-        n_points = resolution[0] * resolution[1]
-
         # Arrange pixel location in scale resolution
         pixel_locations = torch.meshgrid(torch.arange(0, w), torch.arange(0, h))
         pixel_locations = torch.stack(
@@ -170,13 +148,6 @@ class Generator(pl.LightningModule):
         pixel_scaled[:, :, 0] = scale * pixel_scaled[:, :, 0] / (w - 1) - loc
         pixel_scaled[:, :, 1] = scale * pixel_scaled[:, :, 1] / (h - 1) - loc
 
-        # Subsample points if subsample_to is not None and > 0
-        if subsample_to is not None and 0 < subsample_to < n_points:
-            idx = np.random.choice(pixel_scaled.shape[1], size=(subsample_to,),
-                                   replace=False)
-            pixel_scaled = pixel_scaled[:, idx]
-            pixel_locations = pixel_locations[:, idx]
-
         if invert_y_axis:
             assert (image_range == (-1, 1))
             pixel_scaled[..., -1] *= -1.
@@ -184,8 +155,7 @@ class Generator(pl.LightningModule):
 
         return pixel_locations, pixel_scaled
 
-    def origin_to_world(self, n_points, camera_mat, world_mat, scale_mat=None,
-                        invert=False):
+    def origin_to_world(self, n_points, camera_mat, world_mat):
         ''' Transforms origin (camera location) to world coordinates.
 
         Args:
@@ -200,24 +170,13 @@ class Generator(pl.LightningModule):
         # Create origin in homogen coordinates
         p = torch.zeros(batch_size, 4, n_points).to(self.device)
         p[:, -1] = 1.
-
-        if scale_mat is None:
-            scale_mat = torch.eye(4).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
-
-        # Invert matrices
-        if invert:
-            camera_mat = torch.inverse(camera_mat)
-            world_mat = torch.inverse(world_mat)
-            scale_mat = torch.inverse(scale_mat)
-
         # Apply transformation
-        p_world = scale_mat @ world_mat @ camera_mat @ p
-
+        p_world = world_mat @ camera_mat @ p
         # Transform points back to 3D coordinates
         p_world = p_world[:, :3].permute(0, 2, 1)
         return p_world
 
-    def look_at(self, eye, at=np.array([0, 0, 0]), up=np.array([0, 0, 1]), eps=1e-5):
+    def look_at(self, eye, at, up, eps=1e-5):
         at = at.astype(float).reshape(1, 3)
         up = up.astype(float).reshape(1, 3)
         eye = eye.reshape(-1, 3)
@@ -239,22 +198,18 @@ class Generator(pl.LightningModule):
 
         return torch.tensor(r_mat).float().to(self.device)
 
-    def get_random_pose(self, range_u, range_v, range_radius, batch_size, invert=False):
+    def get_random_pose(self, range_u, range_v, range_radius, batch_size):
         location = self.sample_on_sphere(range_u, range_v, batch_size)
         radius = range_radius[0] + \
                  torch.rand(batch_size) * (range_radius[1] - range_radius[0])
         location = location * radius.unsqueeze(-1).to(self.device)
-        R = self.look_at(location.cpu().numpy())
+        R = self.look_at(location.cpu().numpy(), np.array([0, 0, 0]), np.array([0, 0, 1]))
         RT = torch.eye(4).reshape(1, 4, 4).repeat(batch_size, 1, 1)
         RT[:, :3, :3] = R
         RT[:, :3, -1] = location
-
-        if invert:
-            RT = torch.inverse(RT)
         return RT.to(self.device)
 
-    def image_points_to_world(self, image_points, camera_mat, world_mat, scale_mat=None,
-                              invert=False, negative_depth=True):
+    def image_points_to_world(self, image_points, camera_mat, world_mat, negative_depth=True):
         ''' Transforms points on image plane to world coordinates.
 
         In contrast to transform_to_world, no depth value is needed as points on
@@ -264,22 +219,18 @@ class Generator(pl.LightningModule):
             image_points (tensor): image points tensor of size B x N x 2
             camera_mat (tensor): camera matrix
             world_mat (tensor): world matrix
-            scale_mat (tensor): scale matrix
-            invert (bool): whether to invert matrices (default: False)
         '''
         batch_size, n_pts, dim = image_points.shape
         assert (dim == 2)
         depth_image = torch.ones(batch_size, n_pts, 1).to(self.device)
         if negative_depth:
             depth_image *= -1.
-        return self.transform_to_world(image_points, depth_image, camera_mat, world_mat,
-                                       scale_mat, invert=invert)
+        return transform_to_world(image_points, depth_image, camera_mat, world_mat)
 
-    def forward(self, batch_size=32, mode="training"):
+    def forward(self, batch_size, mode="training"):
         camera_mat = self.camera_matrix.repeat(batch_size, 1, 1)
         world_mat = self.get_random_pose(self.range_u, self.range_v, self.range_radius, batch_size)
-        rgb_v = self.volume_render_image(camera_mat, world_mat, batch_size, mode=mode)
-
+        rgb_v = self.volume_render_image(camera_mat, world_mat, batch_size, mode)
         if self.neural_renderer is not None:
             rgb = self.neural_renderer(rgb_v)
         else:
@@ -306,7 +257,7 @@ class Generator(pl.LightningModule):
                                              step_depths)  # shape (batch, num of eval points, 3)
         return point_pos_wc
 
-    def volume_render_image(self, camera_mat, world_mat, batch_size, mode='training'):
+    def volume_render_image(self, camera_mat, world_mat, batch_size, mode):
         img_res = self.feature_img_resolution
         n_steps = self.n_ray_samples
         point_pos_wc = self.cast_ray_and_get_eval_points(img_res, batch_size, self.depth_range, n_steps,
@@ -345,13 +296,13 @@ if __name__ == "__main__":
     normalized_head_data = head_data / uint16_max
     head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
     tf = torch.from_numpy(load_transfer_function()).float()
-    gen = Generator(head_tensor, tf,
-                    feature_img_resolution=256,
-                    range_u=(0., 0.5),
-                    range_v=(0., 0.5),
-                    n_ray_samples=600).eval().cuda()
+    dvr = DirectVolumeRenderer(head_tensor, tf,
+                               feature_img_resolution=256,
+                               range_u=(0., 0.5),
+                               range_v=(0., 0.5),
+                               n_ray_samples=600).eval().cuda()
     with torch.no_grad():
-        img = gen(batch_size=1, mode="testing")
+        img = dvr(batch_size=1, mode="testing")
     to_pil_img = ToPILImage()
     for i in range(img.shape[0]):
         pil_img = to_pil_img(img[i])
