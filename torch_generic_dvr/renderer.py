@@ -7,6 +7,78 @@ import pytorch_lightning as pl
 from samplers import TrilinearVolumeSampler, TransferFunctionModel1D
 from torchvision.transforms import ToPILImage
 from utils import *
+from torch.utils.data import Dataset
+
+
+class RandomCameraPoses(Dataset):
+    """ Random Camara Positions and Poses
+
+        Args:
+            range_u (tuple): rotation range (0 - 1)
+            range_v (tuple): elevation range (0 - 1)
+            range_radius(tuple): radius range
+    """
+
+    def __init__(self, length, range_u, range_v, range_radius):
+        super(RandomCameraPoses, self).__init__()
+        self.length = length
+        self.range_u = range_u
+        self.range_v = range_v
+        self.range_radius = range_radius
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        return self.get_random_pose().squeeze()
+
+    def get_random_pose(self):
+        batch_size = 1
+        location = self.sample_on_sphere(self.range_u, self.range_v, batch_size)
+        radius = self.range_radius[0] + \
+                 torch.rand(batch_size) * (self.range_radius[1] - self.range_radius[0])
+        location = location * radius.unsqueeze(-1)
+        R = self.look_at(location.numpy(), np.array([0, 0, 0]), np.array([0, 0, 1]))
+        RT = torch.eye(4).reshape(1, 4, 4).repeat(batch_size, 1, 1)
+        RT[:, :3, :3] = R
+        RT[:, :3, -1] = location
+        return RT
+
+    @staticmethod
+    def sample_on_sphere(range_u, range_v, batch_size):
+        u = torch.rand(batch_size) * (range_u[1] - range_u[0]) + range_u[0]
+        v = torch.rand(batch_size) * (range_v[1] - range_v[0]) + range_v[0]
+        pi = torch.tensor(math.pi)
+        theta = 2 * pi * u
+        phi = torch.arccos(1 - 2 * v)
+        cx = torch.sin(phi) * torch.cos(theta)
+        cy = torch.sin(phi) * torch.sin(theta)
+        cz = torch.cos(phi)
+        sample = torch.stack([cx, cy, cz], dim=-1).float()
+        return sample
+
+    @staticmethod
+    def look_at(eye, at, up, eps=1e-5):
+        at = at.astype(float).reshape(1, 3)
+        up = up.astype(float).reshape(1, 3)
+        eye = eye.reshape(-1, 3)
+        up = up.repeat(eye.shape[0] // up.shape[0], axis=0)
+        eps = np.array([eps]).reshape(1, 1).repeat(up.shape[0], axis=0)
+
+        z_axis = eye - at
+        z_axis /= np.max(np.stack([np.linalg.norm(z_axis, axis=1, keepdims=True), eps]))
+
+        x_axis = np.cross(up, z_axis)
+        x_axis /= np.max(np.stack([np.linalg.norm(x_axis, axis=1, keepdims=True), eps]))
+
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis /= np.max(np.stack([np.linalg.norm(y_axis, axis=1, keepdims=True), eps]))
+
+        r_mat = np.concatenate(
+            (x_axis.reshape(-1, 3, 1), y_axis.reshape(-1, 3, 1), z_axis.reshape(
+                -1, 3, 1)), axis=2)
+
+        return torch.tensor(r_mat).float()
 
 
 def calc_volume_weights(alpha):
@@ -77,51 +149,33 @@ def transform_to_world(pixels, depth, camera_mat, world_mat, use_absolute_depth=
 
 
 class DirectVolumeRenderer(pl.LightningModule):
-    ''' GIRAFFE Generator Class.
+    """ Direct Volume Renderer.
 
     Args:
-        range_u (tuple): rotation range (0 - 1)
-        range_v (tuple): elevation range (0 - 1)
         n_ray_samples (int): number of samples per ray
-        range_radius(tuple): radius range
         depth_range (tuple): near and far depth plane
         feature_img_resolution (int): resolution of volume-rendered image
         neural_renderer (nn.Module): neural renderer
         fov (float): field of view
-    '''
+    """
 
     def __init__(self,
                  volume,
                  transfer_function_data,
-                 range_u=(0, 0), range_v=(0.25, 0.25), n_ray_samples=64,
-                 range_radius=(2.732, 2.732), depth_range=[0.5, 6.],
-                 feature_img_resolution=16,
+                 n_ray_samples,
+                 feature_img_resolution,
+                 fov,
+                 depth_range,
                  neural_renderer=None,
-                 fov=49.13,
                  ):
         super().__init__()
         self.n_ray_samples = n_ray_samples
-        self.range_u = range_u
-        self.range_v = range_v
         self.feature_img_resolution = feature_img_resolution
-        self.range_radius = range_radius
         self.depth_range = depth_range
         self.camera_matrix = nn.Parameter(get_camera_mat(fov))
         self.volume_sampler = TrilinearVolumeSampler(volume)
         self.tf = TransferFunctionModel1D(transfer_function_data)
         self.neural_renderer = None if neural_renderer is None else neural_renderer
-
-    def sample_on_sphere(self, range_u, range_v, batch_size):
-        u = torch.rand(batch_size) * (range_u[1] - range_u[0]) + range_u[0]
-        v = torch.rand(batch_size) * (range_v[1] - range_v[0]) + range_v[0]
-        pi = torch.tensor(math.pi)
-        theta = 2 * pi * u
-        phi = torch.arccos(1 - 2 * v)
-        cx = torch.sin(phi) * torch.cos(theta)
-        cy = torch.sin(phi) * torch.sin(theta)
-        cz = torch.cos(phi)
-        sample = torch.stack([cx, cy, cz], dim=-1).float().to(self.device)
-        return sample
 
     def arrange_pixels(self, resolution=(128, 128), batch_size=1, image_range=(-1., 1.), invert_y_axis=False):
         ''' Arranges pixels for given resolution in range image_range.
@@ -176,39 +230,6 @@ class DirectVolumeRenderer(pl.LightningModule):
         p_world = p_world[:, :3].permute(0, 2, 1)
         return p_world
 
-    def look_at(self, eye, at, up, eps=1e-5):
-        at = at.astype(float).reshape(1, 3)
-        up = up.astype(float).reshape(1, 3)
-        eye = eye.reshape(-1, 3)
-        up = up.repeat(eye.shape[0] // up.shape[0], axis=0)
-        eps = np.array([eps]).reshape(1, 1).repeat(up.shape[0], axis=0)
-
-        z_axis = eye - at
-        z_axis /= np.max(np.stack([np.linalg.norm(z_axis, axis=1, keepdims=True), eps]))
-
-        x_axis = np.cross(up, z_axis)
-        x_axis /= np.max(np.stack([np.linalg.norm(x_axis, axis=1, keepdims=True), eps]))
-
-        y_axis = np.cross(z_axis, x_axis)
-        y_axis /= np.max(np.stack([np.linalg.norm(y_axis, axis=1, keepdims=True), eps]))
-
-        r_mat = np.concatenate(
-            (x_axis.reshape(-1, 3, 1), y_axis.reshape(-1, 3, 1), z_axis.reshape(
-                -1, 3, 1)), axis=2)
-
-        return torch.tensor(r_mat).float().to(self.device)
-
-    def get_random_pose(self, range_u, range_v, range_radius, batch_size):
-        location = self.sample_on_sphere(range_u, range_v, batch_size)
-        radius = range_radius[0] + \
-                 torch.rand(batch_size) * (range_radius[1] - range_radius[0])
-        location = location * radius.unsqueeze(-1).to(self.device)
-        R = self.look_at(location.cpu().numpy(), np.array([0, 0, 0]), np.array([0, 0, 1]))
-        RT = torch.eye(4).reshape(1, 4, 4).repeat(batch_size, 1, 1)
-        RT[:, :3, :3] = R
-        RT[:, :3, -1] = location
-        return RT.to(self.device)
-
     def image_points_to_world(self, image_points, camera_mat, world_mat, negative_depth=True):
         ''' Transforms points on image plane to world coordinates.
 
@@ -227,9 +248,9 @@ class DirectVolumeRenderer(pl.LightningModule):
             depth_image *= -1.
         return transform_to_world(image_points, depth_image, camera_mat, world_mat)
 
-    def forward(self, batch_size, mode="training"):
+    def forward(self, world_mat, mode="training"):
+        batch_size = world_mat.shape[0]
         camera_mat = self.camera_matrix.repeat(batch_size, 1, 1)
-        world_mat = self.get_random_pose(self.range_u, self.range_v, self.range_radius, batch_size)
         rgb_v = self.volume_render_image(camera_mat, world_mat, batch_size, mode)
         if self.neural_renderer is not None:
             rgb = self.neural_renderer(rgb_v)
@@ -291,18 +312,25 @@ class DirectVolumeRenderer(pl.LightningModule):
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.DEBUG)
+    # load volume data
     head_data = load_head_data().astype(np.float32).transpose([2, 1, 0])
     uint16_max = float(np.iinfo(np.uint16).max)
     normalized_head_data = head_data / uint16_max
     head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
+    # load TF data
     tf = torch.from_numpy(load_transfer_function()).float()
+    # setup random camera
+    range_radius = (2.732, 2.732)
+    range_u = (0., 0.5)
+    range_v = (0., 0.5)
+    random_camera_poses = RandomCameraPoses(100, range_u, range_v, range_radius)
     dvr = DirectVolumeRenderer(head_tensor, tf,
                                feature_img_resolution=256,
-                               range_u=(0., 0.5),
-                               range_v=(0., 0.5),
+                               fov=49.13,
+                               depth_range=[0.5, 6.],
                                n_ray_samples=600).eval().cuda()
     with torch.no_grad():
-        img = dvr(batch_size=1, mode="testing")
+        img = dvr(random_camera_poses[0].unsqueeze(0).cuda(), mode="testing")
     to_pil_img = ToPILImage()
     for i in range(img.shape[0]):
         pil_img = to_pil_img(img[i])
