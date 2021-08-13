@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 from samplers import TrilinearVolumeSampler, TransferFunctionModel1D
 from torchvision.transforms import ToPILImage
 from utils import *
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
 
 class RandomCameraPoses(Dataset):
@@ -110,54 +110,6 @@ class DirectVolumeRenderer(pl.LightningModule):
         self.tf = TransferFunctionModel1D(transfer_function_data)
         self.neural_renderer = None if neural_renderer is None else neural_renderer
 
-    def arrange_pixels(self, resolution, batch_size, image_range=(-1., 1.)):
-        ''' Arranges pixels for given resolution in range image_range.
-
-        The function returns the unscaled pixel locations as integers and the
-        scaled float values.
-
-        Args:
-            resolution (tuple): image resolution
-            batch_size (int): batch size
-            image_range (tuple): range of output points (default [-1, 1])
-        '''
-        h, w = resolution
-        # Arrange pixel location in scale resolution
-        pixel_locations = torch.meshgrid(torch.arange(0, w), torch.arange(0, h))
-        pixel_locations = torch.stack(
-            [pixel_locations[0].to(self.device), pixel_locations[1].to(self.device)],
-            dim=-1).long().view(1, -1, 2).repeat(batch_size, 1, 1)
-        pixel_scaled = pixel_locations.clone().float()
-
-        # Shift and scale points to match image_range
-        scale = (image_range[1] - image_range[0])
-        loc = scale / 2
-        pixel_scaled[:, :, 0] = scale * pixel_scaled[:, :, 0] / (w - 1) - loc
-        pixel_scaled[:, :, 1] = scale * pixel_scaled[:, :, 1] / (h - 1) - loc
-
-        return pixel_locations, pixel_scaled
-
-    def origin_to_world(self, n_points, camera_mat, world_mat):
-        ''' Transforms origin (camera location) to world coordinates.
-
-        Args:
-            n_points (int): how often the transformed origin is repeated in the
-                form (batch_size, n_points, 3)
-            camera_mat (tensor): camera matrix
-            world_mat (tensor): world matrix
-            scale_mat (tensor): scale matrix
-            invert (bool): whether to invert the matrices (default: False)
-        '''
-        batch_size = camera_mat.shape[0]
-        # Create origin in homogen coordinates
-        p = torch.zeros(batch_size, 4, n_points).to(self.device)
-        p[:, -1] = 1.
-        # Apply transformation
-        p_world = world_mat @ camera_mat @ p
-        # Transform points back to 3D coordinates
-        p_world = p_world[:, :3].permute(0, 2, 1)
-        return p_world
-
     def image_points_to_world(self, image_points, camera_mat, world_mat, negative_depth=True):
         ''' Transforms points on image plane to world coordinates.
 
@@ -186,10 +138,13 @@ class DirectVolumeRenderer(pl.LightningModule):
             rgb = rgb_v
         return rgb
 
+    def predict_step(self, batch, _batch_idx, _data_loader_idx=None):
+        return self(batch, mode="predict")
+
     def cast_ray_and_get_eval_points(self, img_res, batch_size, depth_range, n_steps, camera_mat, world_mat,
                                      ray_jittering):
         # Arrange Pixels
-        pixels = self.arrange_pixels((img_res, img_res), batch_size)[1]
+        pixels = self.arrange_pixels((img_res, img_res), batch_size)[1].to(self.device)
         pixels[..., -1] *= -1.
         n_points = img_res * img_res
         # Project to 3D world
@@ -199,7 +154,8 @@ class DirectVolumeRenderer(pl.LightningModule):
         step_depths = depth_range[0] + \
                       torch.linspace(0., 1., steps=n_steps).reshape(1, 1, -1) * (
                               depth_range[1] - depth_range[0])
-        step_depths = step_depths.repeat(batch_size, n_points, 1).to(self.device)
+        step_depths = step_depths.to(self.device)
+        step_depths = step_depths.repeat(batch_size, n_points, 1)
         if ray_jittering:
             step_depths = self.add_noise_to_interval(step_depths)
         point_pos_wc = self.get_evaluation_points(pixel_pos_wc, camera_pos_wc,
@@ -236,6 +192,53 @@ class DirectVolumeRenderer(pl.LightningModule):
         feat_map = feat_map.permute(0, 2, 1).reshape(batch_size, -1, img_res, img_res)  # B x feat x h x w
         feat_map = feat_map.permute(0, 1, 3, 2)  # new to flip x/y
         return feat_map
+
+    @staticmethod
+    def arrange_pixels(resolution, batch_size, image_range=(-1., 1.)):
+        ''' Arranges pixels for given resolution in range image_range.
+
+        The function returns the unscaled pixel locations as integers and the
+        scaled float values.
+
+        Args:
+            resolution (tuple): image resolution
+            batch_size (int): batch size
+            image_range (tuple): range of output points (default [-1, 1])
+        '''
+        h, w = resolution
+        # Arrange pixel location in scale resolution
+        pixel_locations = torch.meshgrid(torch.arange(0, w), torch.arange(0, h))
+        pixel_locations = torch.stack(
+            [pixel_locations[0], pixel_locations[1]],
+            dim=-1).long().view(1, -1, 2).repeat(batch_size, 1, 1)
+        pixel_scaled = pixel_locations.clone().float()
+
+        # Shift and scale points to match image_range
+        scale = (image_range[1] - image_range[0])
+        loc = scale / 2
+        pixel_scaled[:, :, 0] = scale * pixel_scaled[:, :, 0] / (w - 1) - loc
+        pixel_scaled[:, :, 1] = scale * pixel_scaled[:, :, 1] / (h - 1) - loc
+
+        return pixel_locations, pixel_scaled
+
+    def origin_to_world(self, n_points, camera_mat, world_mat):
+        """ Transforms origin (camera location) to world coordinates.
+
+        Args:
+            n_points (int): how often the transformed origin is repeated in the
+                form (batch_size, n_points, 3)
+            camera_mat (tensor): camera matrix
+            world_mat (tensor): world matrix
+        """
+        batch_size = camera_mat.shape[0]
+        # Create origin in homogen coordinates
+        p = torch.zeros(batch_size, 4, n_points).to(self.device)
+        p[:, -1] = 1.
+        # Apply transformation
+        p_world = world_mat @ camera_mat @ p
+        # Transform points back to 3D coordinates
+        p_world = p_world[:, :3].permute(0, 2, 1)
+        return p_world
 
     @staticmethod
     def transform_to_world(pixels, depth, camera_mat, world_mat, use_absolute_depth=True):
@@ -315,17 +318,24 @@ if __name__ == "__main__":
     # load TF data
     tf = torch.from_numpy(load_transfer_function()).float()
     # setup random camera
+    dataset_size = 2
     range_radius = (2.732, 2.732)
     range_u = (0., 0.5)
     range_v = (0., 0.5)
-    random_camera_poses = RandomCameraPoses(100, range_u, range_v, range_radius)
+    random_camera_poses = RandomCameraPoses(dataset_size, range_u, range_v, range_radius)
+    # setup loader
+    batch_size = 1
+    data_loader = DataLoader(random_camera_poses, batch_size=1)
+    # setup DVR
     dvr = DirectVolumeRenderer(head_tensor, tf,
                                feature_img_resolution=256,
                                fov=49.13,
                                depth_range=[0.5, 6.],
-                               n_ray_samples=600).eval().cuda()
-    with torch.no_grad():
-        img = dvr(random_camera_poses[0].unsqueeze(0).cuda(), mode="testing")
+                               n_ray_samples=600)
+    # setup trainer
+    trainer = pl.Trainer(gpus=1, logger=False)
+    img = trainer.predict(dvr, data_loader, return_predictions=True)
+    img = torch.cat(img, dim=0)
     to_pil_img = ToPILImage()
     for i in range(img.shape[0]):
         pil_img = to_pil_img(img[i])
