@@ -1,114 +1,52 @@
-import math
 import torch
 from torch import nn
 import logging
 import numpy as np
 import pytorch_lightning as pl
-from samplers import TrilinearVolumeSampler, TransferFunctionModel1D
+from samplers import TransferFunctionModel1D
 from torchvision.transforms import ToPILImage
+from torch_generic_dvr.interpolations import TrilinearInterpolation
 from utils import *
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 
-class RandomCameraPoses(Dataset):
-    """ Random Camara Positions and Poses
-
-        Args:
-            range_u (tuple): rotation range (0 - 1)
-            range_v (tuple): elevation range (0 - 1)
-            range_radius(tuple): radius range
-    """
-
-    def __init__(self, length, range_u, range_v, range_radius):
-        super(RandomCameraPoses, self).__init__()
-        self.length = length
-        self.range_u = range_u
-        self.range_v = range_v
-        self.range_radius = range_radius
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        return self.get_random_pose().squeeze()
-
-    def get_random_pose(self):
-        batch_size = 1
-        location = self.sample_on_sphere(self.range_u, self.range_v, batch_size)
-        radius = self.range_radius[0] + \
-                 torch.rand(batch_size) * (self.range_radius[1] - self.range_radius[0])
-        location = location * radius.unsqueeze(-1)
-        R = self.look_at(location.numpy(), np.array([0, 0, 0]), np.array([0, 0, 1]))
-        RT = torch.eye(4).reshape(1, 4, 4).repeat(batch_size, 1, 1)
-        RT[:, :3, :3] = R
-        RT[:, :3, -1] = location
-        return RT
-
-    @staticmethod
-    def sample_on_sphere(range_u, range_v, batch_size):
-        u = torch.rand(batch_size) * (range_u[1] - range_u[0]) + range_u[0]
-        v = torch.rand(batch_size) * (range_v[1] - range_v[0]) + range_v[0]
-        pi = torch.tensor(math.pi)
-        theta = 2 * pi * u
-        phi = torch.arccos(1 - 2 * v)
-        cx = torch.sin(phi) * torch.cos(theta)
-        cy = torch.sin(phi) * torch.sin(theta)
-        cz = torch.cos(phi)
-        sample = torch.stack([cx, cy, cz], dim=-1).float()
-        return sample
-
-    @staticmethod
-    def look_at(eye, at, up, eps=1e-5):
-        at = at.astype(float).reshape(1, 3)
-        up = up.astype(float).reshape(1, 3)
-        eye = eye.reshape(-1, 3)
-        up = up.repeat(eye.shape[0] // up.shape[0], axis=0)
-        eps = np.array([eps]).reshape(1, 1).repeat(up.shape[0], axis=0)
-
-        z_axis = eye - at
-        z_axis /= np.max(np.stack([np.linalg.norm(z_axis, axis=1, keepdims=True), eps]))
-
-        x_axis = np.cross(up, z_axis)
-        x_axis /= np.max(np.stack([np.linalg.norm(x_axis, axis=1, keepdims=True), eps]))
-
-        y_axis = np.cross(z_axis, x_axis)
-        y_axis /= np.max(np.stack([np.linalg.norm(y_axis, axis=1, keepdims=True), eps]))
-
-        r_mat = np.concatenate(
-            (x_axis.reshape(-1, 3, 1), y_axis.reshape(-1, 3, 1), z_axis.reshape(
-                -1, 3, 1)), axis=2)
-
-        return torch.tensor(r_mat).float()
-
-
-class DirectVolumeRenderer(pl.LightningModule):
-    """ Direct Volume Renderer.
-
-    Args:
-        n_ray_samples (int): number of samples per ray
-        depth_range (tuple): near and far depth plane
-        feature_img_resolution (int): resolution of volume-rendered image
-        neural_renderer (nn.Module): neural renderer
-        fov (float): field of view
-    """
-
+class DirectVolumeRendering(nn.Module):
     def __init__(self,
-                 volume,
-                 transfer_function_data,
                  n_ray_samples,
                  feature_img_resolution,
-                 fov,
                  depth_range,
-                 neural_renderer=None,
-                 ):
-        super().__init__()
+                 fov,
+                 transfer_function):
+        """
+        :param n_ray_samples: step num along a ray
+        :param feature_img_resolution: resolution of rendered feature image
+        :param depth_range: tuple (depth start, depth end)
+        :param fov: (degree) field of view
+        :param transfer_function: transfer function handling tensor of shape (batch, num of eval points, channel)
+        """
+        super(DirectVolumeRendering, self).__init__()
         self.n_ray_samples = n_ray_samples
         self.feature_img_resolution = feature_img_resolution
         self.depth_range = depth_range
         self.camera_matrix = nn.Parameter(self.get_camera_mat(fov))
-        self.volume_sampler = TrilinearVolumeSampler(volume)
-        self.tf = TransferFunctionModel1D(transfer_function_data)
-        self.neural_renderer = None if neural_renderer is None else neural_renderer
+        self.tf = transfer_function
+        self.trilinear_interpolator = TrilinearInterpolation()
+
+    def forward(self, volume, world_mat, add_noise, device):
+        """
+        forward pass
+        :param volume: should be of shape [B,F,D,H,W], NOTICE!
+        :param world_mat: matrices specifying camera's positions and poses
+        :param add_noise: whether to add ray jitter AND scala noise
+        :param device: which device tensors on
+        :return: feature images rendered by DVR
+        """
+        assert volume.shape[0] == world_mat.shape[0]
+        batch_size = world_mat.shape[0]
+        camera_mat = self.camera_matrix.repeat(batch_size, 1, 1)
+        self.device = device
+        feature_img = self.volume_render_image(volume, camera_mat, world_mat, batch_size, add_noise)
+        return feature_img
 
     def image_points_to_world(self, image_points, camera_mat, world_mat, negative_depth=True):
         ''' Transforms points on image plane to world coordinates.
@@ -127,19 +65,6 @@ class DirectVolumeRenderer(pl.LightningModule):
         if negative_depth:
             depth_image *= -1.
         return self.transform_to_world(image_points, depth_image, camera_mat, world_mat)
-
-    def forward(self, world_mat, mode="training"):
-        batch_size = world_mat.shape[0]
-        camera_mat = self.camera_matrix.repeat(batch_size, 1, 1)
-        rgb_v = self.volume_render_image(camera_mat, world_mat, batch_size, mode)
-        if self.neural_renderer is not None:
-            rgb = self.neural_renderer(rgb_v)
-        else:
-            rgb = rgb_v
-        return rgb
-
-    def predict_step(self, batch, _batch_idx, _data_loader_idx=None):
-        return self(batch, mode="predict")
 
     def cast_ray_and_get_eval_points(self, img_res, batch_size, depth_range, n_steps, camera_mat, world_mat,
                                      ray_jittering):
@@ -162,16 +87,16 @@ class DirectVolumeRenderer(pl.LightningModule):
                                                   step_depths)  # shape (batch, num of eval points, 3)
         return point_pos_wc
 
-    def volume_render_image(self, camera_mat, world_mat, batch_size, mode):
+    def volume_render_image(self, volume, camera_mat, world_mat, batch_size, add_noise):
         img_res = self.feature_img_resolution
         n_steps = self.n_ray_samples
         point_pos_wc = self.cast_ray_and_get_eval_points(img_res, batch_size, self.depth_range, n_steps,
-                                                         camera_mat, world_mat, mode == "training")
-        logging.debug(f"point pos wc shape = {point_pos_wc.shape}")
-        density_scalars = self.volume_sampler(
-            point_pos_wc.unsqueeze(1))  # shape (batch, channel=1, 1, num of eval points)
+                                                         camera_mat, world_mat, add_noise)
+        density_scalars = self.trilinear_interpolator(volume,
+                                                      point_pos_wc.unsqueeze(
+                                                          1))  # shape (batch, channel=1, 1, num of eval points)
         density_scalars = density_scalars.view(batch_size, -1)
-        if mode == 'training':
+        if add_noise:
             # As done in NeRF, add noise during training
             density_scalars += torch.randn_like(density_scalars)
 
@@ -306,6 +231,47 @@ class DirectVolumeRenderer(pl.LightningModule):
         if invert:
             mat = torch.inverse(mat)
         return mat
+
+
+class DirectVolumeRenderer(pl.LightningModule):
+    """ Direct Volume Renderer.
+
+    Args:
+        n_ray_samples (int): number of samples per ray
+        depth_range (tuple): near and far depth plane
+        feature_img_resolution (int): resolution of volume-rendered image
+        neural_renderer (nn.Module): neural renderer
+        fov (float): field of view
+    """
+
+    def __init__(self,
+                 volume,
+                 transfer_function_data,
+                 n_ray_samples,
+                 feature_img_resolution,
+                 fov,
+                 depth_range,
+                 neural_renderer=None,
+                 ):
+        super().__init__()
+        self.neural_renderer = None if neural_renderer is None else neural_renderer
+        self.volume = nn.Parameter(volume.unsqueeze(0), requires_grad=False)
+        self.dvr_op = DirectVolumeRendering(n_ray_samples, feature_img_resolution, depth_range, fov,
+                                            TransferFunctionModel1D(transfer_function_data))
+
+    def forward(self, world_mat, mode="training"):
+        batch_size = world_mat.shape[0]
+        volume_batch = self.volume.repeat(batch_size, 1, 1, 1, 1)
+        add_noise = mode == "training"
+        feature_img = self.dvr_op(volume_batch, world_mat, add_noise, self.device)
+        if self.neural_renderer is not None:
+            rgb = self.neural_renderer(feature_img)
+        else:
+            rgb = feature_img
+        return rgb
+
+    def predict_step(self, batch, _batch_idx, _data_loader_idx=None):
+        return self(batch, mode="predict")
 
 
 if __name__ == "__main__":
