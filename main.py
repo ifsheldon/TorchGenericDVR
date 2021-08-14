@@ -23,7 +23,7 @@ if __name__ == "__main__":
     random_camera_poses = RandomCameraPoses(dataset_size, range_u, range_v, range_radius)
     # setup loader
     batch_size = 1
-    data_loader = DataLoader(random_camera_poses, batch_size=1)
+    data_loader = DataLoader(random_camera_poses, batch_size=batch_size)
     # create transfer functions
     tf = torch.from_numpy(load_transfer_function()).float()
     feature_tf = TransferFunctionModel1D(tf[:, :3])
