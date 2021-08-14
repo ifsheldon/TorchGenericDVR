@@ -2,7 +2,6 @@ import torch
 from torch import nn
 import numpy as np
 import pytorch_lightning as pl
-from .samplers import TransferFunctionModel1D
 from .interpolations import TrilinearInterpolation
 from .utils import *
 
@@ -13,20 +12,25 @@ class DirectVolumeRendering(nn.Module):
                  feature_img_resolution,
                  depth_range,
                  fov,
-                 transfer_function):
+                 feature_transfer_function,
+                 alpha_transfer_function):
         """
         :param n_ray_samples: step num along a ray
         :param feature_img_resolution: resolution of rendered feature image
         :param depth_range: tuple (depth start, depth end)
         :param fov: (degree) field of view
-        :param transfer_function: transfer function handling tensor of shape (batch, num of eval points, channel)
+        :param feature_transfer_function: transfer function for converting features,
+         handling tensor of shape (batch, num of eval points, channel), output shape = (batch, new_channel, num of eval points)
+        :param  alpha_transfer_function: transfer function for generating alpha values,
+         handling tensor of shape (batch, num of eval points, channel), output shape = (batch, 1, num of eval points)
         """
         super(DirectVolumeRendering, self).__init__()
         self.n_ray_samples = n_ray_samples
         self.feature_img_resolution = feature_img_resolution
         self.depth_range = depth_range
         self.camera_matrix = nn.Parameter(self.get_camera_mat(fov))
-        self.tf = transfer_function
+        self.feature_tf = feature_transfer_function
+        self.alpha_tf = alpha_transfer_function
         self.trilinear_interpolator = TrilinearInterpolation()
 
     def forward(self, volume, world_mat, add_noise, device):
@@ -97,16 +101,21 @@ class DirectVolumeRendering(nn.Module):
             # As done in NeRF, add noise during training
             density_scalars += torch.randn_like(density_scalars)
 
-        feature_with_alpha = self.tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, channel)
+        features = self.feature_tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, channel)
+        alphas = self.alpha_tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, 1)
         # Reshape
         n_points = img_res * img_res
-        feature_with_alpha = feature_with_alpha.reshape(batch_size,
-                                                        n_points,
-                                                        n_steps,
-                                                        -1  # channels
-                                                        )
-        features = feature_with_alpha[:, :, :, :-1]
-        alphas = feature_with_alpha[:, :, :, -1]
+        features = features.reshape(
+            batch_size,
+            n_points,
+            n_steps,
+            -1  # channels
+        )
+        alphas = alphas.reshape(
+            batch_size,
+            n_points,
+            n_steps
+        )
         # DVR composition
         weights = self.calc_volume_weights(alphas)
         feat_map = torch.sum(weights.unsqueeze(-1) * features, dim=-2)
@@ -243,7 +252,8 @@ class DirectVolumeRenderer(pl.LightningModule):
 
     def __init__(self,
                  volume,
-                 transfer_function_data,
+                 feature_transfer_function,
+                 alpha_transfer_function,
                  n_ray_samples,
                  feature_img_resolution,
                  fov,
@@ -254,7 +264,7 @@ class DirectVolumeRenderer(pl.LightningModule):
         self.neural_renderer = None if neural_renderer is None else neural_renderer
         self.volume = nn.Parameter(volume.unsqueeze(0), requires_grad=False)
         self.dvr_op = DirectVolumeRendering(n_ray_samples, feature_img_resolution, depth_range, fov,
-                                            TransferFunctionModel1D(transfer_function_data))
+                                            feature_transfer_function, alpha_transfer_function)
 
     def forward(self, world_mat, mode="training"):
         batch_size = world_mat.shape[0]

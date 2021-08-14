@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from torchvision.transforms import ToPILImage
 from torch_generic_dvr.renderer import DirectVolumeRenderer
+from torch_generic_dvr.samplers import TransferFunctionModel1D
 from torch_generic_dvr.utils import load_head_data, load_transfer_function, RandomCameraPoses
 
 if __name__ == "__main__":
@@ -14,8 +15,6 @@ if __name__ == "__main__":
     uint16_max = float(np.iinfo(np.uint16).max)
     normalized_head_data = head_data / uint16_max
     head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
-    # load TF data
-    tf = torch.from_numpy(load_transfer_function()).float()
     # setup random camera
     dataset_size = 2
     range_radius = (2.732, 2.732)
@@ -25,8 +24,13 @@ if __name__ == "__main__":
     # setup loader
     batch_size = 1
     data_loader = DataLoader(random_camera_poses, batch_size=1)
+    # create transfer functions
+    tf = torch.from_numpy(load_transfer_function()).float()
+    feature_tf = TransferFunctionModel1D(tf[:, :3])
+    alpha_tf = TransferFunctionModel1D(tf[:, 3:])
     # setup DVR
-    dvr = DirectVolumeRenderer(head_tensor, tf,
+    dvr = DirectVolumeRenderer(head_tensor,
+                               feature_tf, alpha_tf,
                                feature_img_resolution=256,
                                fov=49.13,
                                depth_range=[0.5, 6.],
