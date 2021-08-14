@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 import torch
 import warnings
-from torch_generic_dvr.interpolations import TrilinearInterpolation
+from .interpolations import TrilinearInterpolation
 import torch.nn.functional as F
 
 
