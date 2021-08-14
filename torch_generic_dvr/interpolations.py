@@ -1,5 +1,4 @@
 import torch
-import pytorch_lightning as pl
 
 """
 reference: https://github.com/tedyhabtegebrial/PyTorch-Trilinear-Interpolation
