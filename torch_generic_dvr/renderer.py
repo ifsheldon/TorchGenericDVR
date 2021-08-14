@@ -1,13 +1,10 @@
 import torch
 from torch import nn
-import logging
 import numpy as np
 import pytorch_lightning as pl
-from samplers import TransferFunctionModel1D
-from torchvision.transforms import ToPILImage
-from torch_generic_dvr.interpolations import TrilinearInterpolation
-from utils import *
-from torch.utils.data import DataLoader
+from .samplers import TransferFunctionModel1D
+from .interpolations import TrilinearInterpolation
+from .utils import *
 
 
 class DirectVolumeRendering(nn.Module):
@@ -272,37 +269,3 @@ class DirectVolumeRenderer(pl.LightningModule):
 
     def predict_step(self, batch, _batch_idx, _data_loader_idx=None):
         return self(batch, mode="predict")
-
-
-if __name__ == "__main__":
-    logging.getLogger().setLevel(logging.DEBUG)
-    # load volume data
-    head_data = load_head_data().astype(np.float32).transpose([2, 1, 0])
-    uint16_max = float(np.iinfo(np.uint16).max)
-    normalized_head_data = head_data / uint16_max
-    head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
-    # load TF data
-    tf = torch.from_numpy(load_transfer_function()).float()
-    # setup random camera
-    dataset_size = 2
-    range_radius = (2.732, 2.732)
-    range_u = (0., 0.5)
-    range_v = (0., 0.5)
-    random_camera_poses = RandomCameraPoses(dataset_size, range_u, range_v, range_radius)
-    # setup loader
-    batch_size = 1
-    data_loader = DataLoader(random_camera_poses, batch_size=1)
-    # setup DVR
-    dvr = DirectVolumeRenderer(head_tensor, tf,
-                               feature_img_resolution=256,
-                               fov=49.13,
-                               depth_range=[0.5, 6.],
-                               n_ray_samples=600)
-    # setup trainer
-    trainer = pl.Trainer(gpus=1, logger=False)
-    img = trainer.predict(dvr, data_loader, return_predictions=True)
-    img = torch.cat(img, dim=0)
-    to_pil_img = ToPILImage()
-    for i in range(img.shape[0]):
-        pil_img = to_pil_img(img[i])
-        pil_img.save(f"test_{i}.png")
