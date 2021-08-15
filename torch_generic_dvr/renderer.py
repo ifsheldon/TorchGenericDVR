@@ -92,11 +92,19 @@ class DirectVolumeRendering(nn.Module):
         img_res = self.feature_img_resolution
         n_steps = self.n_ray_samples
         point_pos_wc = self.cast_ray_and_get_eval_points(img_res, batch_size, self.depth_range, n_steps,
-                                                         camera_mat, world_mat, add_noise)
+                                                         camera_mat, world_mat,
+                                                         add_noise)  # shape (batch, num of eval points, 3)
         density_scalars = self.trilinear_interpolator(volume,
                                                       point_pos_wc.unsqueeze(
-                                                          1))  # shape (batch, channel=1, 1, num of eval points)
-        density_scalars = density_scalars.view(batch_size, -1)
+                                                          1)).squeeze(2)  # shape (batch, channel=1, num of eval points)
+        density_scalars = density_scalars.permute(0, 2, 1)  # shape (batch, num of eval points, channel=1,)
+        # mask out out-of-bound positions
+        padding = 0.01
+        positions_valid = torch.all(point_pos_wc <= 1.0 + padding, dim=-1) & \
+                          torch.all(point_pos_wc >= -1.0 - padding, dim=-1)
+        positions_valid = positions_valid.unsqueeze(-1)\
+            .repeat(1, 1, density_scalars.shape[2])  # shape (batch, num of eval points, channel=1,)
+        density_scalars[~positions_valid] = 0.0
         if add_noise:
             # As done in NeRF, add noise during training
             density_scalars += torch.randn_like(density_scalars)
