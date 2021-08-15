@@ -17,7 +17,7 @@ if __name__ == "__main__":
     head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
     # setup random camera
     dataset_size = 2
-    range_radius = (2.732, 2.732)
+    range_radius = (4.0, 4.0)
     range_u = (0., 0.5)
     range_v = (0., 0.5)
     random_camera_poses = RandomCameraPoses(dataset_size, range_u, range_v, range_radius)
@@ -32,9 +32,9 @@ if __name__ == "__main__":
     dvr = DirectVolumeRenderer(head_tensor,
                                feature_tf, alpha_tf,
                                feature_img_resolution=256,
-                               fov=49.13,
-                               depth_range=[0.5, 6.],
-                               n_ray_samples=600)
+                               fov=45.0,
+                               depth_range=[0.0, 6.],
+                               n_ray_samples=200)
     # setup trainer
     trainer = pl.Trainer(gpus=1, logger=False)
     img = trainer.predict(dvr, data_loader, return_predictions=True)

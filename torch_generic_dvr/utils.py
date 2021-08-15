@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import math
+import glm
 
 
 class RandomCameraPoses(Dataset):
@@ -29,7 +30,11 @@ class RandomCameraPoses(Dataset):
 
     def get_random_pose(self):
         batch_size = 1
-        location = self.sample_on_sphere(self.range_u, self.range_v, batch_size)
+        # location = self.sample_on_sphere(self.range_u, self.range_v, batch_size)
+        location = torch.tensor([0.0, -1.0, 0.0, 1.0]).reshape(4, 1)
+        random_rotation = self.sample_rotations()
+        location = random_rotation @ location
+        location = location[:3, :].view(1, 3)
         radius = self.range_radius[0] + \
                  torch.rand(batch_size) * (self.range_radius[1] - self.range_radius[0])
         location = location * radius.unsqueeze(-1)
@@ -38,6 +43,17 @@ class RandomCameraPoses(Dataset):
         RT[:, :3, :3] = R
         RT[:, :3, -1] = location
         return RT
+
+    @staticmethod
+    def sample_rotations():
+        xyz_angles = torch.rand(3) * 360
+        print(xyz_angles)
+        xyz_angles = torch.deg2rad(xyz_angles)
+        rotation_mat = glm.mat4()
+        rotation_mat = glm.rotate(rotation_mat, xyz_angles[0], glm.vec3(1.0, 0.0, 0.0))
+        rotation_mat = glm.rotate(rotation_mat, xyz_angles[1], glm.vec3(0.0, 1.0, 0.0))
+        rotation_mat = glm.rotate(rotation_mat, xyz_angles[2], glm.vec3(0.0, 0.0, 1.0))
+        return torch.from_numpy(np.array(rotation_mat))
 
     @staticmethod
     def sample_on_sphere(range_u, range_v, batch_size):
@@ -104,3 +120,9 @@ def dump_data(data, file_path):
 
 def load_head_data():
     return load_data("./skewed_head.pickle")
+
+
+if __name__ == "__main__":
+    ran = RandomCameraPoses.sample_rotations()
+    v = torch.tensor([1.1, 1.5, 1.3, 1.0]).reshape(4, 1)
+    print(ran @ v)
