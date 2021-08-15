@@ -14,11 +14,12 @@ class TransferFunctionModel1D(pl.LightningModule):
         :param align_corners: If True, x=0 is mapped to tensor[0]; If false, x= 1/(2*resolution) is mapped to tensor[0]
         """
         super(TransferFunctionModel1D, self).__init__()
-        shape = transfer_function_tensor.shape
-        assert len(shape) == 2  # grid_num * channel_num
-        self.tf = torch.nn.Parameter(transfer_function_tensor.reshape(1, shape[1], 1, shape[0]),
+        assert len(transfer_function_tensor.shape) == 2  # grid_num * channel_num
+        resolution, channel = transfer_function_tensor.shape
+        transfer_function_tensor = transfer_function_tensor.permute(1, 0)
+        self.tf = torch.nn.Parameter(transfer_function_tensor.reshape(1, channel, 1, resolution),
                                      requires_grad=tf_require_grad)  # (N=1, C, H=1, W)
-        self.channel_num = shape[1]
+        self.channel_num = channel
         self.align_corners = align_corners
 
     def forward(self, scalars):
