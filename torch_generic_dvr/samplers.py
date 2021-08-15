@@ -26,7 +26,8 @@ class TransferFunctionModel1D(pl.LightningModule):
         :param scalars: [0,1] values of shape (batch_num, sample_num)
         :return: tensor of shape(batch_num, channel, sample_num)
         """
-        assert len(scalars.shape) == 2  # (N, num)
+        assert len(scalars.shape) == 3 and scalars.shape[2] == 1  # (N, num, channel=1)
+        scalars = scalars.squeeze(2)
         batch, sample_num = scalars.shape
         x_indices = scalars * 2 - 1
         y_indices = -torch.ones_like(x_indices)
