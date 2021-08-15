@@ -16,8 +16,8 @@ if __name__ == "__main__":
     normalized_head_data = head_data / uint16_max
     head_tensor = torch.from_numpy(normalized_head_data).unsqueeze(0)
     # setup random camera
-    dataset_size = 2
-    range_radius = (4.0, 4.0)
+    dataset_size = 5
+    range_radius = (3, 3)
     range_u = (0., 0.5)
     range_v = (0., 0.5)
     random_camera_poses = RandomCameraPoses(dataset_size, range_u, range_v, range_radius)
@@ -33,7 +33,7 @@ if __name__ == "__main__":
                                feature_tf, alpha_tf,
                                feature_img_resolution=256,
                                fov=45.0,
-                               depth_range=[0.0, 6.],
+                               depth_range=[0., 4.],
                                n_ray_samples=200)
     # setup trainer
     trainer = pl.Trainer(gpus=1, logger=False)
