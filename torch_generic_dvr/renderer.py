@@ -20,9 +20,9 @@ class DirectVolumeRendering(nn.Module):
         :param depth_range: tuple (depth start, depth end)
         :param fov: (degree) field of view
         :param feature_transfer_function: transfer function for converting features,
-         handling tensor of shape (batch, num of eval points, channel), output shape = (batch, new_channel, num of eval points)
+         handling tensor of shape (batch, channel, num of eval points), output shape = (batch, new_channel, num of eval points)
         :param  alpha_transfer_function: transfer function for generating alpha values,
-         handling tensor of shape (batch, num of eval points, channel), output shape = (batch, 1, num of eval points)
+         handling tensor of shape (batch, channel, num of eval points), output shape = (batch, 1, num of eval points)
         """
         super(DirectVolumeRendering, self).__init__()
         self.n_ray_samples = n_ray_samples
@@ -94,30 +94,29 @@ class DirectVolumeRendering(nn.Module):
         point_pos_wc = self.cast_ray_and_get_eval_points(img_res, batch_size, self.depth_range, n_steps,
                                                          camera_mat, world_mat,
                                                          add_noise)  # shape (batch, num of eval points, 3)
-        density_scalars = self.trilinear_interpolator(volume,
+        volume_features = self.trilinear_interpolator(volume,
                                                       point_pos_wc.unsqueeze(
-                                                          1)).squeeze(2)  # shape (batch, channel=1, num of eval points)
-        density_scalars = density_scalars.permute(0, 2, 1)  # shape (batch, num of eval points, channel=1,)
+                                                          1)).squeeze(2)  # shape (batch, channel, num of eval points)
         # mask out out-of-bound positions
         padding = 0.01
         positions_valid = torch.all(point_pos_wc <= 1.0 + padding, dim=-1) & \
                           torch.all(point_pos_wc >= -1.0 - padding, dim=-1)
-        positions_valid = positions_valid.unsqueeze(-1)\
-            .repeat(1, 1, density_scalars.shape[2])  # shape (batch, num of eval points, channel=1,)
-        density_scalars[~positions_valid] = 0.0
+        positions_valid = positions_valid.unsqueeze(1) \
+            .repeat(1, volume_features.shape[1], 1)  # shape (batch, channel, num of eval points,)
+        volume_features[~positions_valid] = 0.0
         if add_noise:
             # As done in NeRF, add noise during training
-            density_scalars += torch.randn_like(density_scalars)
+            volume_features += torch.randn_like(volume_features)
 
-        features = self.feature_tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, channel)
-        alphas = self.alpha_tf(density_scalars).permute(0, 2, 1)  # shape(batch, num of eval points, 1)
+        features = self.feature_tf(volume_features)  # shape(batch, channel, num of eval points)
+        alphas = self.alpha_tf(volume_features)  # shape(batch, 1, num of eval points)
         # Reshape
         n_points = img_res * img_res
         features = features.reshape(
             batch_size,
+            -1,  # channels
             n_points,
             n_steps,
-            -1  # channels
         )
         alphas = alphas.reshape(
             batch_size,
@@ -126,9 +125,9 @@ class DirectVolumeRendering(nn.Module):
         )
         # DVR composition
         weights = self.calc_volume_weights(alphas)
-        feat_map = torch.sum(weights.unsqueeze(-1) * features, dim=-2)
+        feat_map = torch.sum(weights.unsqueeze(1) * features, dim=-1)  # shape (Batch, channel, n_points)
         # Reformat output
-        feat_map = feat_map.permute(0, 2, 1).reshape(batch_size, -1, img_res, img_res)  # B x feat x h x w
+        feat_map = feat_map.reshape(batch_size, -1, img_res, img_res)  # B x feat x h x w
         feat_map = feat_map.permute(0, 1, 3, 2)  # new to flip x/y
         return feat_map
 
